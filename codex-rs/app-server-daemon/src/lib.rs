@@ -16,6 +16,8 @@ pub use launch::restart_with_features;
 pub use launch::start_with_features;
 mod managed_install;
 mod prepare_install;
+#[cfg(all(test, target_os = "linux"))]
+mod readiness_tests;
 mod release_pruning;
 pub use prepare_install::InstallRequest;
 pub use prepare_install::update_from_cli;
@@ -49,10 +51,11 @@ use tokio::time::sleep;
 
 const START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 // An older updater can pass background policy to a replacement daemon, so retain
-// the longer readiness allowance during upgrades on macOS.
-#[cfg(target_os = "macos")]
+// the longer readiness allowance during upgrades on macOS. Linux cold starts can
+// also need more than ten seconds to initialize before publishing the socket.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 // Leave room for the longest graceful stop, forced-exit check, and restart.
 const OPERATION_LOCK_TIMEOUT: Duration =
@@ -686,17 +689,20 @@ impl Daemon {
     }
 
     async fn wait_until_ready(&self) -> Result<client::ProbeInfo> {
+        let settings = self.load_settings().await?;
+        let backend = backend::pid_backend(self.backend_paths(&settings));
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
             match client::probe(&self.socket_path).await {
                 Ok(info) => return Ok(info),
-                Err(err) if tokio::time::Instant::now() < deadline => {
-                    let _ = err;
-                    sleep(START_POLL_INTERVAL).await;
-                }
                 Err(err) => {
-                    let context = self.app_server_not_ready_context().await;
-                    return Err(err).context(context);
+                    if tokio::time::Instant::now() >= deadline
+                        || !backend.is_starting_or_running().await?
+                    {
+                        let context = self.app_server_not_ready_context().await;
+                        return Err(err).context(context);
+                    }
+                    sleep(START_POLL_INTERVAL).await;
                 }
             }
         }
